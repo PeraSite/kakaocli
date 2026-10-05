@@ -21,4 +21,9 @@ enum JSONOutput {
         ) else { return }
         Swift.print(String(data: data, encoding: .utf8)!)
     }
+
+    static func printObject(_ item: [String: Any]) throws {
+        let data = try JSONSerialization.data(withJSONObject: item, options: [.prettyPrinted, .sortedKeys])
+        Swift.print(String(data: data, encoding: .utf8)!)
+    }
 }

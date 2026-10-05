@@ -10,6 +10,11 @@ public struct Message: Sendable {
     public let type: MessageType
     public let createdAt: Date
     public let isFromMe: Bool
+    public let messageId: Int64
+    public let previousId: Int64
+    public let rawType: Int
+    public let attachment: String?
+    public let supplement: String?
 
     public enum MessageType: Int, Sendable {
         case text = 1

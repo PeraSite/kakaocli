@@ -89,49 +89,14 @@ struct SyncCommand: ParsableCommand {
     }
 }
 
-/// Resolve database path and key without opening the database.
+/// Validate the local database and resolve its path and key for the watcher.
 func resolveDatabasePath(dbPath: String?, key: String?) throws -> (path: String, key: String?) {
-    if let dbPath {
-        return (dbPath, key)
+    let reader = try LocalDatabase.open(databasePath: dbPath, key: key)
+    defer { reader.close() }
+    if let key { return (reader.databasePath, key) }
+    if try LocalDatabase.isPlaintext(databasePath: reader.databasePath) { return (reader.databasePath, nil) }
+    if let configuration = try LocalDatabaseConfiguration.load() {
+        return (reader.databasePath, KeyDerivation.secureKey(userId: configuration.userId, uuid: configuration.uuid))
     }
-    let uuid = try DeviceInfo.platformUUID()
-
-    // Try standard path: derive userId → derive dbName → find file
-    if let uid = try? DeviceInfo.userId() {
-        let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-        let candidates = [
-            "\(DeviceInfo.containerPath)/\(dbName)",
-            "\(DeviceInfo.containerPath)/\(dbName).db",
-        ]
-        if let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-            let secureKey = key ?? KeyDerivation.secureKey(userId: uid, uuid: uuid)
-            return (found, secureKey)
-        }
-    }
-
-    // Fallback: scan for DB file, try candidate userIds for the key
-    guard let discoveredPath = DeviceInfo.discoverDatabaseFile() else {
-        let uid = try DeviceInfo.userId()
-        let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-        throw KakaoError.databaseNotFound("\(DeviceInfo.containerPath)/\(dbName)")
-    }
-
-    if let key {
-        return (discoveredPath, key)
-    }
-
-    // Try candidate userIds to find a working key
-    var candidateIds = (try? DeviceInfo.userId()).map { [$0] } ?? [Int]()
-    candidateIds += DeviceInfo.candidateUserIds().filter { !candidateIds.contains($0) }
-    for uid in candidateIds {
-        let candidateKey = KeyDerivation.secureKey(userId: uid, uuid: uuid)
-        let reader = DatabaseReader(databasePath: discoveredPath)
-        if reader.tryOpen(key: candidateKey) {
-            reader.close()
-            return (discoveredPath, candidateKey)
-        }
-    }
-
-    // Return the discovered path without a key — caller will get a decryption error
-    return (discoveredPath, nil)
+    return (reader.databasePath, nil)
 }

@@ -1,3 +1,5 @@
+> **PeraSite local-history fork:** Native parallel account recovery, private identity caching, resolved chat names, open-chat kinds, paginated searches, contact candidates and original-message context are built into kakaocli. Start with [LOCAL_HISTORY.md](LOCAL_HISTORY.md). Install the [native CLI skill](skills/kakaocli/SKILL.md) for agent workflows. The historical upstream documentation below also covers separate UI sending features.
+
 # kakaocli
 
 **CLI tool for KakaoTalk on macOS — read chats, search messages, send texts, and integrate with AI agents.**

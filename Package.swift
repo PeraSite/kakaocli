@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 
 import PackageDescription
 
@@ -11,6 +11,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
+        .package(url: "https://github.com/swiftlang/swift-testing.git", revision: "swift-6.2.3-RELEASE"),
     ],
     targets: [
         .executableTarget(
@@ -22,8 +23,9 @@ let package = Package(
         ),
         .target(
             name: "KakaoCore",
-            dependencies: ["CSQLCipher"]
+            dependencies: ["CSQLCipher", "CKakaoRecovery"]
         ),
+        .target(name: "CKakaoRecovery", publicHeadersPath: "include"),
         .systemLibrary(
             name: "CSQLCipher",
             pkgConfig: "sqlcipher",
@@ -31,7 +33,8 @@ let package = Package(
         ),
         .testTarget(
             name: "KakaoCoreTests",
-            dependencies: ["KakaoCore"]
+            dependencies: ["KakaoCore", "CSQLCipher", .product(name: "Testing", package: "swift-testing")]
         ),
-    ]
+    ],
+    cLanguageStandard: .c11
 )

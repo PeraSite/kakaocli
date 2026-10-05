@@ -3,152 +3,52 @@ import Foundation
 import KakaoCore
 
 struct AuthCommand: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "auth",
-        abstract: "Derive keys and verify database access"
-    )
-
-    @Flag(name: .long, help: "Show derived values (key, db name) for debugging")
-    var verbose = false
-
-    @Option(name: .long, help: "Override user ID instead of reading from plist")
-    var userId: Int?
-
-    @Option(name: .long, help: "Override device UUID instead of reading from ioreg")
-    var uuid: String?
+    static let configuration = CommandConfiguration(commandName: "auth",
+        abstract: "Verify and cache local DB identity; no server login or password needed")
+    @Option(name: .long, help: "Encrypted DB file, including a Finder copy") var db: String?
+    @Option(name: .long, help: "Local or copied directory containing KakaoTalk plists") var preferencesDir: String?
+    @Option(name: .long, help: "Known numeric account ID; optional") var userId: Int?
+    @Option(name: .long, help: "Override device UUID") var uuid: String?
+    @Option(name: .long, help: "Recovery wall-clock budget in seconds") var recoverTimeout: Double = 120
+    @Option(name: .long, help: "Exclusive upper bound for numeric IDs") var maxUserId: UInt64 = 6_000_000_000
+    @Option(name: .long, help: "Native recovery threads, 1...64") var workers: Int?
+    @Flag(name: .long, help: "Save verified identity and DB path in mode-0600 config; never saves key") var save = false
+    @Flag(name: .long, help: "Output JSON") var json = false
+    @Flag(name: .long, help: "Show schema names; never outputs key") var verbose = false
 
     func run() throws {
-        // 1. Get device UUID
-        let deviceUUID: String
-        if let override = uuid {
-            deviceUUID = override
+        guard recoverTimeout.isFinite, recoverTimeout > 0, recoverTimeout <= 86400,
+              maxUserId > 0, maxUserId <= 100_000_000_000,
+              workers == nil || (1...64).contains(workers!) else {
+            throw ValidationError("Invalid --recover-timeout, --max-user-id or --workers")
+        }
+        let configuration: LocalDatabaseConfiguration
+        let hasOverrides = db != nil || preferencesDir != nil || userId != nil || uuid != nil
+        if !hasOverrides, let cached = try LocalDatabaseConfiguration.load() {
+            configuration = cached
         } else {
-            deviceUUID = try DeviceInfo.platformUUID()
-        }
-        print("UUID: \(deviceUUID)")
-
-        // 2. Get user ID
-        let uid: Int?
-        if let override = userId {
-            uid = override
-            print("User ID: \(override) (override)")
-        } else {
-            do {
-                let detected = try DeviceInfo.userId()
-                uid = detected
-                print("User ID: \(detected)")
-            } catch {
-                uid = nil
-                let candidates = DeviceInfo.candidateUserIds()
-                print("User ID: auto-detection failed")
-                if !candidates.isEmpty {
-                    print("  Candidates from AlertKakaoIDsList: \(candidates.map(String.init).joined(separator: ", "))")
-                }
+            configuration = try LocalDatabase.configure(databasePath: db, preferencesDirectory: preferencesDir,
+                userId: userId, uuid: uuid, timeout: recoverTimeout, maxId: maxUserId, workers: workers) { message in
+                FileHandle.standardError.write(Data((message + "\n").utf8))
             }
         }
-
-        // 3. Show derived values if we have a userId
-        if let uid, verbose {
-            let dbName = KeyDerivation.databaseName(userId: uid, uuid: deviceUUID)
-            let secureKey = KeyDerivation.secureKey(userId: uid, uuid: deviceUUID)
-            print("Database name: \(dbName)")
-            print("Secure key: \(secureKey.prefix(16))...")
+        let reader = DatabaseReader(databasePath: configuration.databasePath); defer { reader.close() }
+        try reader.open(key: KeyDerivation.secureKey(userId: configuration.userId, uuid: configuration.uuid))
+        guard try reader.myUserId() == Int64(configuration.userId) else {
+            throw ValidationError("Local identity does not match NTChatContext")
         }
-
-        // 4. Discover database file
-        let discoveredDb = DeviceInfo.discoverDatabaseFile()
-        if let discoveredDb {
-            let name = (discoveredDb as NSString).lastPathComponent
-            print("Discovered DB: \(name)")
-        }
-
-        // 5. Try to find working userId + key combination
-        if let uid {
-            let dbName = KeyDerivation.databaseName(userId: uid, uuid: deviceUUID)
-            let candidates = [
-                "\(DeviceInfo.containerPath)/\(dbName)",
-                "\(DeviceInfo.containerPath)/\(dbName).db",
-            ]
-            if let dbPath = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-                print("Database found: \(dbPath)")
-                let secureKey = KeyDerivation.secureKey(userId: uid, uuid: deviceUUID)
-                try verifyDatabase(path: dbPath, key: secureKey)
-                return
-            } else if verbose {
-                print("Derived DB name does not match any file")
-            }
-        }
-
-        // 6. Try discovered DB with candidate userIds
-        if let discoveredDb {
-            let candidateIds: [Int]
-            if let uid {
-                candidateIds = [uid] + DeviceInfo.candidateUserIds().filter { $0 != uid }
-            } else {
-                candidateIds = DeviceInfo.candidateUserIds()
-            }
-
-            if !candidateIds.isEmpty {
-                print("\nTrying candidate user IDs against discovered DB...")
-                for candidate in candidateIds {
-                    let candidateKey = KeyDerivation.secureKey(userId: candidate, uuid: deviceUUID)
-                    let reader = DatabaseReader(databasePath: discoveredDb)
-                    if reader.tryOpen(key: candidateKey) {
-                        print("  userId=\(candidate): OK")
-                        let tables = try reader.schema()
-                        print("\nDatabase opened successfully with userId=\(candidate)!")
-                        print("Tables found: \(tables.count)")
-                        for table in tables {
-                            print("  - \(table.name)")
-                        }
-                        reader.close()
-                        return
-                    } else {
-                        if verbose {
-                            print("  userId=\(candidate): key mismatch")
-                        }
-                    }
-                }
-            }
-
-            // None of the candidate keys worked
-            print("\nNo candidate user ID produced a valid key.")
-            print("The database file exists but could not be decrypted.")
-            print("\nTo provide your user ID manually:")
-            print("  kakaocli auth --user-id <YOUR_KAKAO_USER_ID>")
-            print("\nTo find your user ID, check your KakaoTalk mobile app settings")
-            print("or search your plist: defaults read com.kakao.KakaoTalkMac")
-            throw ExitCode.failure
-        }
-
-        // 7. No DB found at all
-        print("\nNo database file found in: \(DeviceInfo.containerPath)")
-        let containerURL = URL(fileURLWithPath: DeviceInfo.containerPath)
-        if let files = try? FileManager.default.contentsOfDirectory(at: containerURL, includingPropertiesForKeys: nil) {
-            print("Container contents:")
-            for file in files where !file.lastPathComponent.hasSuffix("-shm") && !file.lastPathComponent.hasSuffix("-wal") {
-                print("  \(file.lastPathComponent)")
-            }
-        } else {
-            print("  Could not list directory (check Full Disk Access)")
-        }
-        throw ExitCode.failure
-    }
-
-    private func verifyDatabase(path: String, key: String) throws {
-        let reader = DatabaseReader(databasePath: path)
-        do {
-            try reader.open(key: key)
-            let tables = try reader.schema()
-            print("\nDatabase opened successfully!")
-            print("Tables found: \(tables.count)")
-            for table in tables {
-                print("  - \(table.name)")
-            }
-        } catch {
-            print("\nFailed to open database: \(error)")
-            print("This may mean the key is wrong or SQLCipher is needed.")
-            print("Install SQLCipher: brew install sqlcipher")
+        let tables = try reader.schema()
+        if save { try configuration.save() }
+        let item: [String: Any] = ["verified": true, "database_path": reader.databasePath,
+            "config_saved": save, "config_path": LocalDatabaseConfiguration.defaultPath,
+            "read_only": true, "tables": tables.count, "rooms": try reader.countChats(),
+            "messages": try reader.countMessages(), "key_persisted": false]
+        if json { try JSONOutput.printObject(item) }
+        else {
+            print("Local database verified (read-only): \(reader.databasePath)")
+            print("Rooms: \(item["rooms"]!) · messages: \(item["messages"]!)")
+            if save { print("Private identity cache saved: \(LocalDatabaseConfiguration.defaultPath)") }
+            if verbose { for table in tables { print("  \(table.name)") } }
         }
     }
 }

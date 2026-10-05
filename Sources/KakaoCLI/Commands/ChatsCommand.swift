@@ -10,6 +10,14 @@ struct ChatsCommand: ParsableCommand {
 
     @Option(name: .long, help: "Maximum number of chats to show")
     var limit: Int = 50
+    @Option(name: .long, help: "Skip this many rows")
+    var offset: Int = 0
+    @Option(name: .long, help: "Filter room kind (open, open-direct, open-group, channel, direct, group, self)")
+    var kind: String?
+    @Flag(name: .long, help: "Only rooms with messages authored by you")
+    var contacted = false
+    @Flag(name: .long, help: "JSON page with total and next_offset")
+    var page = false
 
     @Flag(name: .long, help: "Output as JSON")
     var json = false
@@ -21,26 +29,17 @@ struct ChatsCommand: ParsableCommand {
     var key: String?
 
     func run() throws {
+        try validatePage(limit: limit, offset: offset); try validateKind(kind)
         let reader = try openDatabase(dbPath: db, key: key)
         defer { reader.close() }
 
-        let chats = try reader.chats(limit: limit)
+        let chats = try reader.chats(limit: limit, offset: offset, kind: kind, contacted: contacted)
 
-        if json {
-            let items = chats.map { chat -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": chat.id,
-                    "type": chat.type.rawValue,
-                    "display_name": chat.displayName,
-                    "member_count": chat.memberCount,
-                    "unread_count": chat.unreadCount,
-                ]
-                if let ts = chat.lastMessageAt {
-                    dict["last_message_at"] = ISO8601DateFormatter().string(from: ts)
-                }
-                return dict
-            }
-            JSONOutput.printArray(items)
+        if page {
+            try printPage(chats.map(chatJSON), total: reader.countChats(kind: kind, contacted: contacted), limit: limit,
+                          offset: offset, databasePath: reader.databasePath)
+        } else if json {
+            JSONOutput.printArray(chats.map(chatJSON))
         } else {
             if chats.isEmpty {
                 print("No chats found.")
@@ -56,72 +55,7 @@ struct ChatsCommand: ParsableCommand {
 }
 
 func openDatabase(dbPath: String?, key: String?, userId userIdOverride: Int? = nil) throws -> DatabaseReader {
-    let path: String
-    let secureKey: String?
-
-    if let dbPath {
-        path = dbPath
-        secureKey = key
-    } else {
-        let uuid = try DeviceInfo.platformUUID()
-
-        // Try standard path: derive userId → derive dbName → find file
-        if let uid = try? (userIdOverride ?? DeviceInfo.userId()) {
-            let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-            let candidates = [
-                "\(DeviceInfo.containerPath)/\(dbName)",
-                "\(DeviceInfo.containerPath)/\(dbName).db",
-            ]
-            if let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-                path = found
-                secureKey = key ?? KeyDerivation.secureKey(userId: uid, uuid: uuid)
-                let reader = DatabaseReader(databasePath: path)
-                try reader.open(key: secureKey)
-                return reader
-            }
-        }
-
-        // Fallback: scan for DB file, then try candidate userIds
-        guard let discoveredPath = DeviceInfo.discoverDatabaseFile() else {
-            let uid = try userIdOverride ?? DeviceInfo.userId()
-            let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-            throw KakaoError.databaseNotFound("\(DeviceInfo.containerPath)/\(dbName)")
-        }
-
-        // Try provided key first
-        if let key {
-            path = discoveredPath
-            secureKey = key
-        } else {
-            // Try each candidate userId to find the working key
-            let candidateIds: [Int]
-            if let override = userIdOverride {
-                candidateIds = [override]
-            } else {
-                var ids = (try? DeviceInfo.userId()).map { [$0] } ?? []
-                ids += DeviceInfo.candidateUserIds().filter { !ids.contains($0) }
-                candidateIds = ids
-            }
-
-            var foundKey: String?
-            for uid in candidateIds {
-                let candidateKey = KeyDerivation.secureKey(userId: uid, uuid: uuid)
-                let reader = DatabaseReader(databasePath: discoveredPath)
-                if reader.tryOpen(key: candidateKey) {
-                    reader.close()
-                    foundKey = candidateKey
-                    break
-                }
-            }
-
-            path = discoveredPath
-            secureKey = foundKey
-        }
-    }
-
-    let reader = DatabaseReader(databasePath: path)
-    try reader.open(key: secureKey)
-    return reader
+    try LocalDatabase.open(databasePath: dbPath, key: key, userId: userIdOverride)
 }
 
 func formatDate(_ date: Date) -> String {

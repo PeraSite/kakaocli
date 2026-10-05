@@ -39,8 +39,10 @@ public final class DatabaseReader: @unchecked Sendable {
 
                 do {
                     try exec("PRAGMA cipher_default_compatibility = \(compat)")
-                    try exec("PRAGMA KEY='\(key)'")
+                    try exec("PRAGMA KEY='\(key.replacingOccurrences(of: "'", with: "''"))'")
+                    try exec("PRAGMA cipher_compatibility = \(compat)")
                     try exec("SELECT count(*) FROM sqlite_master")
+                    try installReadOnlyGuard()
                     return // success
                 } catch {
                     continue
@@ -60,7 +62,30 @@ public final class DatabaseReader: @unchecked Sendable {
                 let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
                 throw KakaoError.databaseOpenFailed(msg)
             }
+            try installReadOnlyGuard()
         }
+    }
+
+    private func installReadOnlyGuard() throws {
+        try exec("PRAGMA query_only=ON")
+        sqlite3_busy_timeout(db, 5000)
+        sqlite3_set_authorizer(db, { _, action, arg1, arg2, _, _ in
+            switch action {
+            case SQLITE_ATTACH, SQLITE_DETACH, SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE,
+                 SQLITE_CREATE_TABLE, SQLITE_CREATE_INDEX, SQLITE_CREATE_TRIGGER, SQLITE_CREATE_VIEW,
+                 SQLITE_CREATE_TEMP_TABLE, SQLITE_CREATE_TEMP_INDEX, SQLITE_CREATE_TEMP_TRIGGER, SQLITE_CREATE_TEMP_VIEW,
+                 SQLITE_DROP_TABLE, SQLITE_DROP_INDEX, SQLITE_DROP_TRIGGER, SQLITE_DROP_VIEW, SQLITE_ALTER_TABLE:
+                return SQLITE_DENY
+            case SQLITE_FUNCTION:
+                if arg2.map({ String(cString: $0).lowercased() }) == "load_extension" { return SQLITE_DENY }
+            case SQLITE_PRAGMA:
+                let name = arg1.map { String(cString: $0).lowercased() } ?? ""
+                let inspections = ["integrity_check", "quick_check", "table_info", "table_xinfo", "index_info", "index_xinfo", "index_list", "foreign_key_list", "foreign_key_check"]
+                if arg2 != nil && !inspections.contains(name) { return SQLITE_DENY }
+            default: break
+            }
+            return SQLITE_OK
+        }, nil)
     }
 
     /// Try opening the database with a key. Returns true if the key is valid.
@@ -84,103 +109,19 @@ public final class DatabaseReader: @unchecked Sendable {
     // MARK: - Queries
 
     /// List all chat rooms.
-    public func chats(limit: Int = 50) throws -> [Chat] {
-        let sql = """
-            SELECT r.chatId, r.type, r.chatName, r.activeMembersCount,
-                   r.lastLogId, r.lastUpdatedAt, r.countOfNewMessage,
-                   u.displayName, u.friendNickName, u.nickName
-            FROM NTChatRoom r
-            LEFT JOIN NTUser u ON r.directChatMemberUserId = u.userId AND u.linkId = 0
-            ORDER BY r.lastUpdatedAt DESC
-            LIMIT ?
-            """
-        return try query(sql, bind: [.int(limit)]) { row in
-            // For direct chats, use the friend's name; for groups, use chatName
-            let chatName = row.string(2)
-            let displayName = row.string(7) ?? row.string(8) ?? row.string(9)
-            let name = chatName ?? displayName ?? "(unknown)"
-
-            return Chat(
-                id: row.int64(0),
-                type: Chat.ChatType.from(rawInt: row.int(1)),
-                displayName: name,
-                memberCount: row.int(3),
-                lastMessageId: row.optionalInt64(4),
-                lastMessageAt: row.optionalKakaoDate(5),
-                unreadCount: row.int(6)
-            )
-        }
+    public func chats(limit: Int = 50, offset: Int = 0, kind: String? = nil, contacted: Bool = false) throws -> [Chat] {
+        let all = try localChats().filter { $0.kind.matches(kind) && (!contacted || $0.sentMessageCount > 0) }
+        return Array(all.dropFirst(max(0, offset)).prefix(max(0, limit)))
     }
 
     /// Get messages for a chat, optionally filtered by time.
-    public func messages(chatId: Int64? = nil, since: Date? = nil, limit: Int = 50) throws -> [Message] {
-        var conditions: [String] = []
-        var bindings: [SQLValue] = []
-
-        if let chatId {
-            conditions.append("m.chatId = ?")
-            bindings.append(.int64(chatId))
-        }
-        if let since {
-            // KakaoTalk stores timestamps as seconds since epoch
-            conditions.append("m.sentAt >= ?")
-            bindings.append(.int64(Int64(since.timeIntervalSince1970)))
-        }
-
-        let where_ = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
-
-        let sql = """
-            SELECT m.logId, m.chatId, m.authorId,
-                   COALESCE(u.displayName, u.friendNickName, u.nickName) as senderName,
-                   m.message, m.type, m.sentAt
-            FROM NTChatMessage m
-            LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
-            \(where_)
-            ORDER BY m.sentAt DESC
-            LIMIT ?
-            """
-        bindings.append(.int(limit))
-
-        let myUserId = try self.myUserId()
-        return try query(sql, bind: bindings) { row in
-            Message(
-                id: row.int64(0),
-                chatId: row.int64(1),
-                senderId: row.int64(2),
-                senderName: row.string(3),
-                text: row.string(4),
-                type: Message.MessageType(rawValue: row.int(5)),
-                createdAt: row.kakaoDate(6),
-                isFromMe: row.int64(2) == myUserId
-            )
-        }
+    public func messages(chatId: Int64? = nil, since: Date? = nil, limit: Int = 50, offset: Int = 0, sender: String = "any") throws -> [Message] {
+        try localMessages(chatId: chatId, since: since, limit: limit, offset: offset, sender: sender)
     }
 
     /// Full-text search across messages.
-    public func search(query: String, limit: Int = 20) throws -> [Message] {
-        let sql = """
-            SELECT m.logId, m.chatId, m.authorId,
-                   COALESCE(u.displayName, u.friendNickName, u.nickName) as senderName,
-                   m.message, m.type, m.sentAt
-            FROM NTChatMessage m
-            LEFT JOIN NTUser u ON m.authorId = u.userId AND u.linkId = 0
-            WHERE m.message LIKE ?
-            ORDER BY m.sentAt DESC
-            LIMIT ?
-            """
-        let myUserId = try self.myUserId()
-        return try self.query(sql, bind: [.string("%\(query)%"), .int(limit)]) { row in
-            Message(
-                id: row.int64(0),
-                chatId: row.int64(1),
-                senderId: row.int64(2),
-                senderName: row.string(3),
-                text: row.string(4),
-                type: Message.MessageType(rawValue: row.int(5)),
-                createdAt: row.kakaoDate(6),
-                isFromMe: row.int64(2) == myUserId
-            )
-        }
+    public func search(query: String, limit: Int = 20, offset: Int = 0, chatId: Int64? = nil, sender: String = "any") throws -> [Message] {
+        try localMessages(chatId: chatId, text: query, limit: limit, offset: offset, sender: sender)
     }
 
     /// Get the logged-in user's ID from NTChatContext.
@@ -236,15 +177,24 @@ public final class DatabaseReader: @unchecked Sendable {
     /// Run an arbitrary read-only SQL query and return results as arrays of Any.
     public func rawQuery(_ sql: String) throws -> [[Any]] {
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+        var extra = ""
+        let status = sql.withCString { pointer in
+            var tail: UnsafePointer<CChar>?
+            let status = sqlite3_prepare_v2(db, pointer, -1, &stmt, &tail)
+            if let tail { extra = String(cString: tail).trimmingCharacters(in: .whitespacesAndNewlines) }
+            return status
+        }
+        guard status == SQLITE_OK, stmt != nil else {
             let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
             throw KakaoError.sqlError("prepare: \(msg)")
         }
         defer { sqlite3_finalize(stmt) }
+        guard extra.isEmpty, sqlite3_stmt_readonly(stmt) != 0 else { throw KakaoError.sqlError("One read-only SQL statement is required") }
 
         let colCount = sqlite3_column_count(stmt)
         var results: [[Any]] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
             var row: [Any] = []
             for i in 0..<colCount {
                 switch sqlite3_column_type(stmt, i) {
@@ -261,8 +211,45 @@ public final class DatabaseReader: @unchecked Sendable {
                 }
             }
             results.append(row)
+            step = sqlite3_step(stmt)
         }
+        guard step == SQLITE_DONE else { throw KakaoError.sqlError(String(cString: sqlite3_errmsg(db))) }
         return results
+    }
+
+    public func rawNamedQuery(_ sql: String) throws -> [[String: Any]] {
+        var stmt: OpaquePointer?
+        var extra = ""
+        let status = sql.withCString { pointer in
+            var tail: UnsafePointer<CChar>?
+            let status = sqlite3_prepare_v2(db, pointer, -1, &stmt, &tail)
+            if let tail { extra = String(cString: tail).trimmingCharacters(in: .whitespacesAndNewlines) }
+            return status
+        }
+        guard status == SQLITE_OK, let stmt else { throw KakaoError.sqlError(String(cString: sqlite3_errmsg(db))) }
+        defer { sqlite3_finalize(stmt) }
+        guard extra.isEmpty, sqlite3_stmt_readonly(stmt) != 0 else {
+            throw KakaoError.sqlError("One read-only SQL statement is required")
+        }
+        let columns = (0..<sqlite3_column_count(stmt)).map { String(cString: sqlite3_column_name(stmt, $0)) }
+        var rows: [[String: Any]] = [], step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            var row: [String: Any] = [:]
+            for i in 0..<sqlite3_column_count(stmt) {
+                let name = columns[Int(i)]
+                switch sqlite3_column_type(stmt, i) {
+                case SQLITE_INTEGER:
+                    let value = sqlite3_column_int64(stmt, i)
+                    row[name] = name.lowercased().hasSuffix("id") ? String(value) : value as Any
+                case SQLITE_FLOAT: row[name] = sqlite3_column_double(stmt, i)
+                case SQLITE_TEXT: row[name] = String(cString: sqlite3_column_text(stmt, i))
+                default: row[name] = NSNull()
+                }
+            }
+            rows.append(row); step = sqlite3_step(stmt)
+        }
+        guard step == SQLITE_DONE else { throw KakaoError.sqlError(String(cString: sqlite3_errmsg(db))) }
+        return rows
     }
 
     /// Discover the actual database schema.
@@ -285,7 +272,7 @@ public final class DatabaseReader: @unchecked Sendable {
         case null
     }
 
-    private func exec(_ sql: String) throws {
+    func exec(_ sql: String) throws {
         var errMsg: UnsafeMutablePointer<CChar>?
         let result = sqlite3_exec(db, sql, nil, nil, &errMsg)
         if result != SQLITE_OK {
@@ -295,7 +282,7 @@ public final class DatabaseReader: @unchecked Sendable {
         }
     }
 
-    private func query<T>(_ sql: String, bind: [SQLValue], transform: (Row) -> T) throws -> [T] {
+    func query<T>(_ sql: String, bind: [SQLValue], transform: (Row) -> T) throws -> [T] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
@@ -306,7 +293,7 @@ public final class DatabaseReader: @unchecked Sendable {
         for (i, value) in bind.enumerated() {
             let idx = Int32(i + 1)
             switch value {
-            case .int(let v): sqlite3_bind_int(stmt, idx, Int32(v))
+            case .int(let v): sqlite3_bind_int64(stmt, idx, Int64(v))
             case .int64(let v): sqlite3_bind_int64(stmt, idx, v)
             case .double(let v): sqlite3_bind_double(stmt, idx, v)
             case .string(let v): sqlite3_bind_text(stmt, idx, v, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
@@ -315,9 +302,12 @@ public final class DatabaseReader: @unchecked Sendable {
         }
 
         var results: [T] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var status = sqlite3_step(stmt)
+        while status == SQLITE_ROW {
             results.append(transform(Row(stmt: stmt!)))
+            status = sqlite3_step(stmt)
         }
+        guard status == SQLITE_DONE else { throw KakaoError.sqlError(String(cString: sqlite3_errmsg(db))) }
         return results
     }
 
@@ -345,6 +335,11 @@ public final class DatabaseReader: @unchecked Sendable {
             sqlite3_column_int(stmt, col) != 0
         }
 
+        func data(_ col: Int32) -> Data? {
+            guard let ptr = sqlite3_column_blob(stmt, col) else { return nil }
+            return Data(bytes: ptr, count: Int(sqlite3_column_bytes(stmt, col)))
+        }
+
         /// KakaoTalk stores timestamps as seconds since epoch.
         func kakaoDate(_ col: Int32) -> Date {
             let ts = sqlite3_column_int64(stmt, col)
@@ -354,18 +349,6 @@ public final class DatabaseReader: @unchecked Sendable {
         func optionalKakaoDate(_ col: Int32) -> Date? {
             let val = sqlite3_column_int64(stmt, col)
             return val == 0 ? nil : Date(timeIntervalSince1970: Double(val))
-        }
-    }
-}
-
-extension Chat.ChatType {
-    /// Map KakaoTalk's integer chat type to our enum.
-    static func from(rawInt: Int) -> Self {
-        // KakaoTalk uses integer types; exact mapping TBD via testing
-        switch rawInt {
-        case 0: return .direct
-        case 1: return .group
-        default: return .unknown
         }
     }
 }
