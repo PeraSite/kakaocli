@@ -63,7 +63,7 @@ Chat names come from local custom names, group metadata, open-link titles, conta
 
 ## Skill
 
-`skills/kakaocli/SKILL.md` directs agents to these native commands and explains coverage, pagination, evidence and contact identity checks. Copy that folder to `~/.codex/skills/kakaocli` to install it in Codex. The skill's runtime dependency is the compiled `kakaocli` binary.
+`skills/kakaocli/SKILL.md` directs agents to these native commands and explains coverage, pagination, evidence and contact identity checks. Copy that folder to `~/.agents/skills/kakaocli` for shared discovery by compatible agents. The skill's runtime dependency is the compiled `kakaocli` binary.
 
 ## Validation
 

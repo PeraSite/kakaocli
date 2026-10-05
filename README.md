@@ -26,14 +26,14 @@ The fork reports `0.7.0-local.1`. Your terminal needs permission to read the ori
 ## Use with an agent
 
 ```sh
-mkdir -p ~/.codex/skills
-cp -R skills/kakaocli ~/.codex/skills/
+mkdir -p ~/.agents/skills
+cp -R skills/kakaocli ~/.agents/skills/
 kakaocli chats --kind open --page
 kakaocli candidates --term '사장님' --term '대표님' --kind one-to-one --page
 kakaocli search '사장님' --sender me --page
 ```
 
-The [kakaocli skill](skills/kakaocli/SKILL.md) calls this native binary. For example: `$kakaocli 내가 연락했던 사장님과 가게를 대화 근거와 함께 전부 찾아줘`.
+The [kakaocli skill](skills/kakaocli/SKILL.md) calls this native binary. Install it in the shared `~/.agents/skills` directory for agents that support this discovery path. For example: `$kakaocli 내가 연락했던 사장님과 가게를 대화 근거와 함께 전부 찾아줘`.
 
 Candidates require context review: mentioning an owner in a friend chat does not establish contact with that owner. The skill checks original messages, separates store channels and group conversations, and follows all matching result pages. A local copy includes only its captured history; `status` exposes the source and available message period.
 
