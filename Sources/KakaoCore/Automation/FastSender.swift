@@ -174,22 +174,26 @@ private final class Kakao {
         else { out["step"] = "NO_CHAT_MENU_ITEM"; return nil }
         act(item, kAXPressAction)
         var found: AXUIElement?
-        // A hidden app or a closed main window gives no "카카오톡" window: unhide and press again once.
-        if !waitFor(8, 0.1, { !self.windows(named: "카카오톡").isEmpty }) {
+        let hasMain = { !self.windows(named: "카카오톡").isEmpty }
+        // With the main window closed (or the app hidden), "창 → 채팅" alone shows nothing.
+        // "Reopen" — what clicking the Dock icon does — recreates the main window; KakaoTalk can take a few
+        // seconds to build it (measured 2026-11-22: absent after 5 s, present on the next run). Still no activation.
+        if !waitFor(5, 0.1, hasMain) {
             setAX(app, kAXHiddenAttribute, kCFBooleanFalse)
             NSRunningApplication(processIdentifier: pid)?.unhide()
-            act(item, kAXPressAction)
-            out["unhid"] = true
-            if !waitFor(8, 0.1, { !self.windows(named: "카카오톡").isEmpty }),
-               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: FastSender.bundleId) {
-                // "Reopen" (like clicking the Dock icon) shows the main window, still without activating.
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: FastSender.bundleId) {
                 let cfg = NSWorkspace.OpenConfiguration()
                 cfg.activates = false
                 NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in }
-                out["reopened"] = true
-                waitFor(20, 0.1) { !self.windows(named: "카카오톡").isEmpty }
+            }
+            out["reopened"] = true
+            for _ in 0..<3 where !hasMain() {  // press the menu again while waiting, up to ~12 s
+                waitFor(40, 0.1, hasMain)
                 act(item, kAXPressAction)
             }
+            out["ms_reopen"] = ms()
+            if !hasMain() { out["step"] = "NO_MAIN_WINDOW"; return nil }
+            act(item, kAXPressAction)  // make sure the visible main window is on the chats tab
         }
         waitFor(30, 0.1) {
             guard let w = self.windows(named: "카카오톡").first else { return false }
