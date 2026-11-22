@@ -1,0 +1,64 @@
+#!/bin/bash
+# Run kakaocli as its own macOS "responsible process" so that only kakaocli needs Full Disk Access and
+# Accessibility — not your terminal, Python, Node or agent app.
+#
+# macOS attributes permissions to the app that launched a process. `kakaocli …` typed in Terminal is checked
+# against Terminal's permissions. This wrapper asks launchd to start kakaocli directly (no shell in between),
+# waits for it, prints its output and returns its exit code.
+#
+#   kakao status --json
+#   kakao send "Chat name" "Hello"
+#   kakao send --chat-id 123 --file message.txt --json
+#
+# LOCO-free by construction (kakaocli never talks to Kakao servers). The UI-collection commands
+# harvest/login/sync/inspect are not passed through.
+set -uo pipefail
+KAKAOCLI="${KAKAOCLI:-$HOME/.local/bin/kakaocli}"
+case "${1:-}" in
+  ""|-h|--help|help) sed -n '2,15p' "$0"; exit 0 ;;
+  harvest|login|sync|inspect) echo "kakao: '$1' is not available through this wrapper" >&2; exit 2 ;;
+esac
+dir="$(mktemp -d -t kakao-run)"; chmod 700 "$dir"
+# launchd cannot hand our stdin to kakaocli: `send … -` becomes `send … --file <tmp>`
+if [ "${1:-}" = send ]; then
+  set -- "$@"; new=()
+  for a in "$@"; do
+    if [ "$a" = - ]; then cat > "$dir/stdin.txt"; new+=(--file "$dir/stdin.txt"); else new+=("$a"); fi
+  done
+  set -- "${new[@]}"
+fi
+label="com.github.kakaocli.run.$$.$RANDOM"
+dom="gui/$(id -u)"
+cleanup() { launchctl bootout "$dom/$label" >/dev/null 2>&1; rm -rf "$dir"; }
+trap cleanup EXIT
+args=""
+for a in "$KAKAOCLI" "$@"; do
+  a="${a//&/&amp;}"; a="${a//</&lt;}"; a="${a//>/&gt;}"
+  args+="<string>$a</string>"
+done
+cat > "$dir/job.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$label</string>
+<key>ProgramArguments</key><array>$args</array>
+<key>StandardOutPath</key><string>$dir/out</string>
+<key>StandardErrorPath</key><string>$dir/err</string>
+<key>RunAtLoad</key><true/>
+<key>ProcessType</key><string>Interactive</string>
+<key>Umask</key><integer>63</integer>
+</dict></plist>
+EOF
+launchctl bootstrap "$dom" "$dir/job.plist" || exit 1
+code=""
+for _ in $(seq 1 12000); do  # up to 10 minutes
+  info="$(launchctl print "$dom/$label" 2>/dev/null)"
+  if [ -n "$info" ] && ! grep -q "state = running" <<<"$info" && ! grep -q "runs = 0" <<<"$info"; then
+    code="$(sed -n 's/^[[:space:]]*last exit code = \(-\{0,1\}[0-9][0-9]*\).*/\1/p' <<<"$info" | head -1)"
+    [ -n "$code" ] && break
+  fi
+  sleep 0.05
+done
+[ -f "$dir/out" ] && cat "$dir/out"
+[ -s "$dir/err" ] && cat "$dir/err" >&2
+exit "${code:-124}"
