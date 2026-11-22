@@ -6,22 +6,82 @@ This fork of [silver-flight-group/kakaocli](https://github.com/silver-flight-gro
 
 ## Install and configure
 
-Requirements: macOS, Swift 6.1 or newer, and SQLCipher. Tested with Apple Swift 6.2.3.
+Requirements: macOS, Swift 6.1 or newer, SQLCipher and the KakaoTalk Mac app. Tested with Apple Swift 6.4.
 
 ```sh
 brew install sqlcipher
 git clone https://github.com/PeraSite/kakaocli.git
 cd kakaocli
-swift build -c release
-mkdir -p ~/.local/bin
-install -m 755 .build/release/kakaocli ~/.local/bin/kakaocli
+./scripts/install.sh            # build, sign, install ~/.local/bin/kakaocli
 export PATH="$HOME/.local/bin:$PATH"
 kakaocli --version
-kakaocli auth --save --json
-kakaocli status --json
 ```
 
-The fork reports `0.7.0-local.1`. Your terminal needs permission to read the original KakaoTalk container, or you can use an authorized local copy. See [LOCAL_HISTORY.md](LOCAL_HISTORY.md) for copied DB/preferences setup, recovery options, private configuration and full CLI examples. These read commands do not need server login, a KakaoTalk password, UI interaction or LOCO.
+`install.sh` signs with an "Apple Development" or "Developer ID Application" identity from your keychain when
+there is one. macOS then ties the permissions below to that certificate and they survive rebuilds. With an
+ad-hoc signature every rebuild silently loses them.
+
+### Permissions
+
+kakaocli needs two macOS permissions, and **only kakaocli** needs them:
+
+| Permission | Used for |
+|---|---|
+| Full Disk Access | read the local KakaoTalk database (history, chat list, delivery check) |
+| Accessibility | send: open the chat window, type into the input box, press send |
+
+System Settings → Privacy & Security → *Full Disk Access* and → *Accessibility* → **+** → press ⌘⇧G →
+`~/.local/bin/kakaocli`. If an older `kakaocli` entry is listed, remove it with **−** first (it is tied to the old
+signature).
+
+macOS checks the permissions of the app that *launched* a process. `kakaocli` typed in Terminal is checked
+against Terminal, so you would have to give Terminal (and every script running in it) access to your whole disk.
+Instead run it through **`scripts/kakao`**, which asks launchd to start kakaocli directly:
+
+```sh
+install -m 755 scripts/kakao ~/.local/bin/kakao
+kakao permissions          # Read local DB: ok · Accessibility: ok
+kakao status --json
+kakao auth --save --json
+```
+
+`kakao` takes the same arguments as `kakaocli` and returns its output and exit code.
+
+See [LOCAL_HISTORY.md](LOCAL_HISTORY.md) for copied DB/preferences setup, recovery options, private configuration
+and full read examples. Reading needs no server login, KakaoTalk password, UI interaction or LOCO.
+
+## Send messages
+
+```sh
+kakao send "Chat name" "Hello"                 # exact name, else a unique substring
+kakao send --chat-id 1234567890 "Hello"        # IDs from `kakao chats --page`
+kakao send --me "note to self"
+kakao send --chat-id 1234567890 --file msg.txt --json
+kakao send "Chat name" "Hello" --dry-run       # open, type, clear, close — nothing is sent
+```
+
+Sending drives the real KakaoTalk app through the macOS Accessibility API, like a person typing on the Mac.
+It never emulates Kakao's server protocol (LOCO). What happens:
+
+1. KakaoTalk is launched if it is not running, without coming to the front.
+2. The chat window opens, fastest path first: an already open window; for one-to-one friend chats the
+   `kakaotalk://friend?action=chat&user_id=…` deep link; otherwise the main window chat list, reading only the
+   rows near the index predicted from the local DB ordering, then selecting the row and sending Return to
+   KakaoTalk only (no mouse, no clipboard).
+3. The text goes into the input box and send is pressed. A box that already contains text you were typing is
+   never touched.
+4. The window it opened is closed and the app you were using gets the focus back.
+5. The local DB is checked for the new message from you with exactly that text.
+
+A group chat measured 1.9 s end to end, including the database check.
+
+Exit codes: `0` sent and found in the DB, `1` not sent (nothing was pressed), `2` chat not found or ambiguous,
+`3` send was pressed but the message did not show up in the DB — check KakaoTalk before retrying.
+`--json` prints `ok`, `step`, `pressed`, `how` (`already_open` · `deeplink` · `return` · `menu`), `verified`,
+`log_id` and timings.
+
+Chats inside folders (quiet chat rooms) have no row in the main list and are refused, as are names that match
+several chats. Opening a chat marks its unread messages as read.
 
 ## Use with an agent
 
@@ -37,7 +97,7 @@ The [kakaocli skill](skills/kakaocli/SKILL.md) calls this native binary. Install
 
 Candidates require context review: mentioning an owner in a friend chat does not establish contact with that owner. The skill checks original messages, separates store channels and group conversations, and follows all matching result pages. A local copy includes only its captured history; `status` exposes the source and available message period.
 
-Run `swift test` for synthetic encrypted DB tests and `swift build -c release` to build. Existing UI sending, login and harvest commands are retained from upstream; [upstream documentation](https://github.com/silver-flight-group/kakaocli/blob/8b6ffcfdaebc592a735dc1a8bd5e50037e626406/README.md) covers those separate features. The local-history skill uses the local read workflow.
+Run `swift test` for synthetic encrypted DB and chat-list ordering tests. `send` is this fork's own implementation; the upstream login and harvest commands are retained unchanged ([upstream documentation](https://github.com/silver-flight-group/kakaocli/blob/8b6ffcfdaebc592a735dc1a8bd5e50037e626406/README.md)).
 
 ## Disclaimer
 
@@ -81,6 +141,8 @@ Developed by **[Brian ByungHyun Shin](https://github.com/brianshin22)** at **[Si
 Database decryption approach based on research by [blluv](https://gist.github.com/blluv/8418e3ef4f4aa86004657ea524f2de14).
 
 Inspired by [wacli](https://github.com/steipete/wacli) by Peter Steinberger — a similar CLI tool for WhatsApp on Mac.
+
+The chat-opening flow and KakaoTalk UI labels used by `send` follow the measurements in [kakaocli-skill](https://github.com/Tygb99/kakaocli-skill) by Tygb99 (MIT, Copyright (c) 2026 Tygb99), reimplemented with direct Accessibility calls.
 
 Built with [Claude Code](https://claude.ai/code).
 

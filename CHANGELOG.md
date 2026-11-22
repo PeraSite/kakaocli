@@ -1,5 +1,11 @@
 # Changelog
 
+### v0.8.0 - Fast UI sending and isolated permissions (fork)
+- `send` rewritten: resolves the chat in the local DB (name, `--chat-id`, `--me`), opens it by deep link (one-to-one) or by the predicted chat-list row, types and presses send through Accessibility only, closes the window it opened and confirms delivery in the local DB. `--file`, stdin, `--dry-run`, `--json`, exit codes 0/1/2/3. No LOCO.
+- `permissions` command: reports Full Disk Access and Accessibility for this executable (`--prompt` asks macOS).
+- `scripts/install.sh`: builds and signs with a keychain development identity so permissions survive rebuilds.
+- `scripts/kakao`: runs kakaocli through launchd so only kakaocli, not the terminal, needs the permissions.
+
 ### v0.5.0 - Chat Harvest (Phase 4)
 - `harvest` command: bulk-capture chat display names and load message history
 - Vision framework OCR to locate "View Previous Chats" button
