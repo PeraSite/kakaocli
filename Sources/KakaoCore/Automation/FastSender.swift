@@ -145,6 +145,24 @@ private func postReturn(_ pid: pid_t) {
     for down in [true, false] { CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: down)?.postToPid(pid) }
 }
 
+// Windows on other Spaces are not in kAXWindows. They can be reached by building the element from its
+// remote token (pid, 0, "coco", element id), the method AltTab uses (github.com/lwouis/alt-tab-macos).
+@_silgen_name("_AXUIElementCreateWithRemoteToken")
+private func _AXUIElementCreateWithRemoteToken(_ token: CFData) -> Unmanaged<AXUIElement>?
+
+func remoteWindowsRange(_ pid: pid_t, _ r: Range<UInt64>) -> [(AXUIElement, UInt64)] {
+    var out: [(AXUIElement, UInt64)] = []
+    var token = Data(count: 20)
+    token.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
+    token.replaceSubrange(8..<12, with: withUnsafeBytes(of: Int32(0x636f636f)) { Data($0) })
+    for id in r {
+        token.replaceSubrange(12..<20, with: withUnsafeBytes(of: id) { Data($0) })
+        guard let e = _AXUIElementCreateWithRemoteToken(token as CFData)?.takeRetainedValue() else { continue }
+        if (ax(e, kAXRoleAttribute) as? String) == (kAXWindowRole as String) { out.append((e, id)) }
+    }
+    return out
+}
+
 // MARK: - KakaoTalk UI
 
 private final class Kakao {
@@ -157,7 +175,37 @@ private final class Kakao {
         AXUIElementSetMessagingTimeout(app, 3.0)
     }
     func ms() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
-    var windows: [AXUIElement] { (ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? [] }
+    /// Windows including those on other Spaces: kAXWindows lists only the current Space's, so with a
+    /// full-screen app in front KakaoTalk seemed to have no windows at all (2026-11-27 NO_MAIN_WINDOW).
+    /// Windows including those on other Spaces. kAXWindows lists only the current Space's, so with a
+    /// full-screen app in front KakaoTalk seemed to have no windows (2026-11-27 NO_MAIN_WINDOW). The others are
+    /// found once by remote token, and windows opened later are the app's focused/main window (measured: a window
+    /// KakaoTalk opens on its own Space becomes AXFocusedWindow even while another Space is shown).
+    private var offSpace: [AXUIElement] = []
+    private var scanned = false
+    var windows: [AXUIElement] {
+        var res = (ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+        func add(_ w: AXUIElement) { if !res.contains(where: { CFEqual($0, w) }) { res.append(w) } }
+        if !scanned {
+            scanned = true
+            offSpace = remoteWindowsRange(pid, 0..<3000).map(\.0)
+        }
+        for a in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+            if let w = ax(app, a), role(w as! AXUIElement) == kAXWindowRole {
+                let w = w as! AXUIElement
+                if !offSpace.contains(where: { CFEqual($0, w) }) { offSpace.append(w) }
+            }
+        }
+        offSpace.removeAll { role($0) != kAXWindowRole }  // closed windows stop answering
+        offSpace.forEach(add)
+        return res
+    }
+    /// The main window is not on the Space being shown (a full-screen app is in front). Return keys sent to the
+    /// app do nothing then, so rows are opened with the context menu.
+    func isOffSpace(_ w: AXUIElement) -> Bool {
+        !((ax(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []).contains { CFEqual($0, w) }
+    }
+    var allWindows: [AXUIElement] { windows }
     func windows(named t: String) -> [AXUIElement] { windows.filter { nfc(title($0)) == nfc(t) } }
 
     /// The chat window's input box (description "메시지 입력").
@@ -313,24 +361,26 @@ private final class Kakao {
         guard let row else { out["step"] = req.group == nil ? "NOT_IN_LIST" : "GROUP_NOT_IN_LIST"; return nil }
 
         guard req.group != nil else {
-            guard let how = openRow(row, list: list, in: main, &out) else { return nil }
+            guard let how = openAndWait(row, list: list, in: main, &out, { self.windows(named: req.title).first }) else {
+            if out["step"] == nil { out["step"] = "NOT_OPENED_AFTER_PRESS" }; return nil
+        }
             out["how"] = how
             return waitChatWindow(req.title, &out).map { ($0, true) }
         }
 
         // Group row: it opens an untitled window listing the link's chats; open ours from there.
         let before = windows.filter { title($0).isEmpty }
-        guard let how = openRow(row, list: list, in: main, &out) else { return nil }
         var gw: AXUIElement?
         var glist: AXUIElement?
-        waitFor(40, 0.1) {
+        let how = openAndWait(row, list: list, in: main, &out) {
             for w in self.windows where title(w).isEmpty {
                 guard let sa = kids(w, kAXScrollAreaRole).first, let l = kids(sa).first, role(l) == kAXTableRole else { continue }
                 let rs = (ax(l, kAXRowsAttribute) as? [AXUIElement]) ?? kids(l, kAXRowRole)
-                if rs.contains(where: { self.rowTitle($0) == nfc(req.title) }) { gw = w; glist = l; return true }
+                if rs.contains(where: { self.rowTitle($0) == nfc(req.title) }) { gw = w; glist = l; return w }
             }
-            return false
+            return nil
         }
+        guard let how else { if out["step"] == nil { out["step"] = "GROUP_NOT_OPENED" }; return nil }
         out["ms_group"] = ms()
         guard let gw, let glist else { out["step"] = "GROUP_NOT_OPENED"; return nil }
         let groupOpenedByUs = !before.contains { CFEqual($0, gw) }
@@ -338,9 +388,24 @@ private final class Kakao {
         let grows = (ax(glist, kAXRowsAttribute) as? [AXUIElement]) ?? kids(glist, kAXRowRole)
         let hits = grows.filter { rowTitle($0) == nfc(req.title) }
         if hits.count != 1 { out["step"] = hits.isEmpty ? "NOT_IN_GROUP" : "AMBIGUOUS"; return nil }
-        guard let how2 = openRow(hits[0], list: glist, in: gw, &out) else { return nil }
+        guard let how2 = openAndWait(hits[0], list: glist, in: gw, &out, { self.windows(named: req.title).first }) else {
+            if out["step"] == nil { out["step"] = "NOT_OPENED_AFTER_PRESS" }; return nil
+        }
         out["how"] = "group:\(how)+\(how2)"
         return waitChatWindow(req.title, &out).map { ($0, true) }
+    }
+
+    /// Open a row and wait until `appeared` finds the window it opens. A Return that opened nothing within 2 s
+    /// (seen when KakaoTalk is on another Space) is followed by the context menu once; opening twice only
+    /// brings the same window forward. Returns how, or nil (with `step` set when the row could not be pressed).
+    func openAndWait(_ row: AXUIElement, list: AXUIElement, in win: AXUIElement, _ out: inout [String: Any],
+                     _ appeared: @escaping () -> AXUIElement?) -> String? {
+        guard let how = openRow(row, list: list, in: win, &out) else { return nil }
+        if waitFor(how == "return" ? 20 : 50, 0.1, { appeared() != nil }) { return how }
+        guard how == "return" else { return nil }
+        out["return_no_window"] = true
+        guard let how2 = openRow(row, list: list, in: win, menuOnly: true, &out) else { return nil }
+        return waitFor(50, 0.1, { appeared() != nil }) ? "return+\(how2)" : nil
     }
 
     func waitChatWindow(_ t: String, _ out: inout [String: Any]) -> AXUIElement? {
@@ -358,8 +423,11 @@ private final class Kakao {
     /// message could be sent, so Return is sent only when the selected row is this row alone, `win` is main
     /// and the focus is on its list.
     /// Path 2: the row's context menu "채팅방 열기", only if the row still shows the same title.
-    func openRow(_ row: AXUIElement, list: AXUIElement, in win: AXUIElement, _ out: inout [String: Any]) -> String? {
+    func openRow(_ row: AXUIElement, list: AXUIElement, in win: AXUIElement, menuOnly: Bool = false, _ out: inout [String: Any]) -> String? {
         let want = rowTitle(row)
+        if menuOnly || isOffSpace(win) {
+            out["off_space"] = !menuOnly
+        } else {
         setAX(row, kAXSelectedAttribute, kCFBooleanTrue)
         if waitFor(10, 0.05, { flag(row, kAXSelectedAttribute) }) {
             if !flag(win, kAXMainAttribute) { setAX(win, kAXMainAttribute, kCFBooleanTrue) }
@@ -374,6 +442,7 @@ private final class Kakao {
             out["return_skipped"] = focusedOK ? "SELECT_CHANGED" : "FOCUS_NOT_CONFIRMED"
         } else {
             out["return_skipped"] = "SELECT_NOT_CONFIRMED"
+        }
         }
         guard rowTitle(row) == want, let cell = kids(row).first else { out["step"] = "ROW_MOVED"; return nil }
         act(row, "AXScrollToVisible")
@@ -536,6 +605,18 @@ extension FastSender {
         for s in steps {
             lines.append("## \(s)")
             if s == "wins" { lines += k.windows.map { "win: \(title($0))" }; continue }
+            if s == "appwins" {
+                for a in [kAXFocusedWindowAttribute, kAXMainWindowAttribute] {
+                    if let w = ax(k.app, a) { lines.append("\(a): t=\(title(w as! AXUIElement)) sub=\(str(w as! AXUIElement, kAXSubroleAttribute))") } else { lines.append("\(a): nil") }
+                }
+                lines += kids(k.app).map { "child: \(role($0)) \(title($0))" }
+                let t0 = Date(); let n = remoteWindowsRange(k.pid, 0..<UInt64(Int(ProcessInfo.processInfo.environment["N"] ?? "20000")!))
+                lines.append("scan \(Int(Date().timeIntervalSince(t0)*1000))ms: " + n.map { "\($0.1)=\(title($0.0))" }.joined(separator: ", "))
+                continue
+            }
+            if s == "allwins" {
+                lines += k.allWindows.map { "aw: \(title($0)) sub=\(str($0, kAXSubroleAttribute))" }; continue
+            }
             if s == "close-untitled" { lines += k.windows.filter { title($0).isEmpty }.map { "closed=\(k.close($0))" }; continue }
             if s == "main" {
                 var out: [String: Any] = [:]
@@ -560,6 +641,22 @@ extension FastSender {
             if s.hasPrefix("row=") {
                 let want = nfc(String(s.dropFirst(4)))
                 for (i, r) in rows.enumerated() where k.rowTitle(r) == want { lines.append("index \(i)"); dump(r, 1, depth + 2) }
+                continue
+            }
+            if s.hasPrefix("menu=") || s.hasPrefix("menupress=") {
+                let press = s.hasPrefix("menupress=")
+                let parts = String(s.drop(while: { $0 != "=" }).dropFirst()).components(separatedBy: "|")
+                let want = nfc(parts[0])
+                guard let r = rows.first(where: { k.rowTitle($0) == want }), let cell = kids(r).first else { lines.append("row not found"); continue }
+                act(r, "AXScrollToVisible")
+                act(cell, kAXShowMenuAction)
+                pause(0.5)
+                guard let mn = kids(cell, kAXMenuRole).first else { lines.append("no menu"); continue }
+                let items = kids(mn)
+                lines.append("items=\(items.map(title))")
+                if press, parts.count > 1, let it = items.first(where: { title($0) == parts[1] }) { act(it, kAXPressAction); lines.append("pressed") }
+                else { act(mn, kAXCancelAction) }
+                pause(1.0)
                 continue
             }
             if s.hasPrefix("win=") {
