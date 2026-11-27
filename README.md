@@ -77,11 +77,16 @@ A group chat measured 1.9 s end to end, including the database check.
 
 Exit codes: `0` sent and found in the DB, `1` not sent (nothing was pressed), `2` chat not found or ambiguous,
 `3` send was pressed but the message did not show up in the DB — check KakaoTalk before retrying.
-`--json` prints `ok`, `step`, `pressed`, `how` (`already_open` · `deeplink` · `return` · `menu`), `verified`,
-`log_id` and timings.
+`--json` prints `ok`, `step`, `pressed`, `how` (`already_open` · `deeplink` · `return` · `menu` ·
+`group:<how>+<how>`), `verified`, `log_id` and timings.
 
-Chats inside folders (quiet chat rooms) have no row in the main list and are refused, as are names that match
-several chats. Opening a chat marks its unread messages as read.
+Chats that came in through a one-to-one open chat link you host (NTChatRoom.vtype ≠ 0) have no row of their own:
+KakaoTalk shows them all as one row "오픈채팅, <link name>". kakaocli opens that row, which shows a window listing
+the link's chats, opens the chat from there and closes the list window again. Names that match several chats are
+refused. Opening a chat marks its unread messages as read.
+
+`kakaocli ui-probe main side=open rows "row=<title>" wins "win=<title>"` dumps parts of the UI without activating
+KakaoTalk, for working on the send flow (hidden command).
 
 ## Use with an agent
 

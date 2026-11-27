@@ -72,18 +72,27 @@ struct SendCommand: ParsableCommand {
         let rows = try reader.rawNamedQuery("""
             SELECT chatId, coalesce(type,0) AS t, coalesce(pin,-1) AS pin, coalesce(countOfNewMessage,0)>0 AS unread,
             coalesce(lastUpdatedAt,0) AS last, coalesce(linkId,0)>0 AS open, coalesce(vtype,0) AS vtype,
-            coalesce(directChatMemberUserId,0) AS peerId FROM NTChatRoom
+            coalesce(directChatMemberUserId,0) AS peerId, coalesce(linkId,0) AS linkId FROM NTChatRoom
             """)
         let split = (try? reader.rawNamedQuery("SELECT boolValue AS v FROM NTSetting WHERE key='openchatlist_issperated'"))?
             .first.flatMap { int($0["v"]) } ?? 0
         let list = rows.map { r in
             ChatListRow(chatId: Int64(string(r["chatId"])) ?? 0, type: Int(int(r["t"]) ?? 0), pin: Int(int(r["pin"]) ?? -1),
                         unread: (int(r["unread"]) ?? 0) != 0, lastUpdatedAt: int(r["last"]) ?? 0,
-                        isOpen: (int(r["open"]) ?? 0) != 0, vtype: Int(int(r["vtype"]) ?? 0))
+                        isOpen: (int(r["open"]) ?? 0) != 0, vtype: Int(int(r["vtype"]) ?? 0),
+                        linkId: Int64(string(r["linkId"])) ?? 0)
         }
         let place = ChatListOrder.guess(list, chatId: target.id, splitOpenList: split != 0)
-        if place.inFolder { return finish(["ok": false, "step": "CHAT_IN_FOLDER", "chat": target.displayName], 1) }
         let me = rows.first { string($0["chatId"]) == String(target.id) }
+        // Chats that came in through a one-to-one open chat link you host share one list row named after the link.
+        var group: String?
+        if place.grouped {
+            let link = string(me?["linkId"])
+            let name = (try? reader.rawNamedQuery("SELECT coalesce(linkName,'') AS n FROM NTOpenLink WHERE linkId=\(Int64(link) ?? 0)"))?
+                .first.map { string($0["n"]) } ?? ""
+            guard !name.isEmpty else { return finish(["ok": false, "step": "GROUP_NAME_UNKNOWN", "chat": target.displayName], 1) }
+            group = name
+        }
         let peer = target.kind == .direct ? Int64(string(me?["peerId"])).flatMap { $0 > 0 ? $0 : nil } : nil
 
         let myId = try reader.myUserId()
@@ -91,7 +100,7 @@ struct SendCommand: ParsableCommand {
             .first.flatMap { Int64(string($0["m"])) } ?? 0
 
         var res = FastSender.send(FastSendRequest(chatId: target.id, title: target.displayName, text: text, dryRun: dryRun,
-                                                  side: place.side, guesses: place.guesses, peerUserId: peer))
+                                                  side: place.side, guesses: place.guesses, peerUserId: peer, group: group))
         res["chat"] = target.displayName
         res["chat_id"] = String(target.id)
         if dryRun { return finish(res, (res["ok"] as? Bool) == true ? 0 : 1) }
